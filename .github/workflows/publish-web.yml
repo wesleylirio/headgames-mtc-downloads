@@ -1,0 +1,70 @@
+name: Publicar jogos no Cloudflare Pages
+
+on:
+  release:
+    types: [published]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: headgames-pages-production
+  cancel-in-progress: false
+
+jobs:
+  publish:
+    if: github.event_name == 'workflow_dispatch' || github.event.release.prerelease == false
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    env:
+      GH_TOKEN: ${{ github.token }}
+      GH_REPO: ${{ github.repository }}
+      PAGES_PROJECT: headgames
+      PAGES_URL: https://headgames-4nh.pages.dev
+      CLOUDFLARE_ACCOUNT_ID: ${{ vars.CLOUDFLARE_ACCOUNT_ID }}
+    steps:
+      - uses: actions/setup-node@v6
+        with:
+          node-version: '22'
+      - name: Baixar o pacote da release estável mais recente
+        run: |
+          tag=$(gh release view --json tagName --jq .tagName)
+          gh release download "$tag" --pattern HeadGames-Web.zip --pattern update.json
+          unzip -q HeadGames-Web.zip -d site
+          version=$(jq -er '.version | select(type == "string")' site/version.json)
+          android=$(jq -er '.versionName' update.json)
+          if [[ "$tag" != "v$version" || "$version" != "$android" || ! "$version" =~ ^[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
+            echo 'As versões do site, Android e release precisam ser iguais.' >&2
+            exit 1
+          fi
+          test -f site/index.html
+          test -f site/jogar/index.html
+          echo "RELEASE_VERSION=$version" >> "$GITHUB_ENV"
+      - name: Publicar na branch de produção do Pages
+        env:
+          CLOUDFLARE_API_TOKEN: ${{ secrets.CLOUDFLARE_API_TOKEN }}
+        run: |
+          if [[ -z "$CLOUDFLARE_API_TOKEN" || -z "$CLOUDFLARE_ACCOUNT_ID" ]]; then
+            echo 'Configure CLOUDFLARE_API_TOKEN nos secrets e CLOUDFLARE_ACCOUNT_ID nas variáveis do repositório.' >&2
+            exit 1
+          fi
+          branch=$(curl --fail --silent --show-error \
+            --header "Authorization: Bearer $CLOUDFLARE_API_TOKEN" \
+            "https://api.cloudflare.com/client/v4/accounts/$CLOUDFLARE_ACCOUNT_ID/pages/projects/$PAGES_PROJECT" \
+            | jq -er '.result.production_branch | select(type == "string" and length > 0)')
+          npx --yes wrangler@4.162.0 pages deploy site --project-name "$PAGES_PROJECT" \
+            --branch "$branch" --commit-message "HeadGames $RELEASE_VERSION"
+      - name: Confirmar a versão pública
+        run: |
+          for attempt in {1..12}; do
+            if curl --fail --silent --show-error --max-time 10 \
+              "$PAGES_URL/version.json?run=$GITHUB_RUN_ID&attempt=$attempt" \
+              | jq -e --arg version "$RELEASE_VERSION" '.version == $version' > /dev/null; then
+              echo "Versão $RELEASE_VERSION confirmada em $PAGES_URL/jogar/" >> "$GITHUB_STEP_SUMMARY"
+              exit 0
+            fi
+            sleep 5
+          done
+          echo "O Pages ainda não confirmou a versão $RELEASE_VERSION." >&2
+          exit 1
